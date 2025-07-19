@@ -1,0 +1,239 @@
+name: CI/CD Pipeline untuk GKE
+
+# Pipeline berjalan otomatis setiap push ke branch main
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER_NAME }}
+  GKE_ZONE: ${{ secrets.GKE_CLUSTER_ZONE }}
+  DEPLOYMENT_NAME: todo-api
+  IMAGE: todo-api
+
+jobs:
+  # TAHAP 1: Lint, Test & SonarQube
+  lint-test-sonar:
+    name: "1️⃣ Lint, Test & SonarQube"
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout kode
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Diperlukan untuk SonarQube analysis
+
+    - name: Setup Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: 🔍 Jalankan Lint dengan flake8
+      run: |
+        echo "🔍 Mengecek gaya penulisan kode dengan flake8..."
+        # Check untuk error kritis
+        flake8 app tests --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Check untuk style dan kompleksitas
+        flake8 app tests --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: 🎨 Format check dengan black
+      run: |
+        echo "🎨 Mengecek format kode dengan black..."
+        black --check app tests --diff
+
+    - name: 🧪 Jalankan Unit Tests
+      run: |
+        echo "🧪 Menjalankan unit tests..."
+        pytest tests/ -v --cov=app --cov-report=xml --cov-report=term-missing
+
+    - name: 📊 SonarQube Analysis
+      uses: SonarSource/sonarqube-scan-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+    - name: ✅ SonarQube Quality Gate
+      uses: sonarqube-quality-gate-action@master
+      timeout-minutes: 5
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # TAHAP 2: Build & Push Docker Image
+  build-push-image:
+    name: "2️⃣ Build & Push Docker Image"
+    runs-on: ubuntu-latest
+    needs: lint-test-sonar  # Job berjalan berurutan setelah tahap 1
+    if: github.ref == 'refs/heads/main'  # Hanya untuk push ke main branch
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout kode
+      uses: actions/checkout@v4
+
+    - name: Setup Google Cloud CLI
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure Docker untuk GCR
+      run: |
+        echo "🔐 Konfigurasi Docker untuk Google Container Registry..."
+        gcloud --quiet auth configure-docker
+
+    - name: 🏷️ Generate image tags dan metadata
+      id: meta
+      run: |
+        # Tag dengan commit SHA dan latest
+        IMAGE_TAG="gcr.io/$PROJECT_ID/$IMAGE:${{ github.sha }}"
+        IMAGE_LATEST="gcr.io/$PROJECT_ID/$IMAGE:latest"
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+        echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_ENV
+        echo "tags=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: 🔨 Build Docker Image
+      id: build
+      run: |
+        echo "🔨 Building Docker image dari Dockerfile di root repository..."
+        echo "📋 Image akan di-tag dengan:"
+        echo "  - Commit SHA: $IMAGE_TAG"
+        echo "  - Latest: $IMAGE_LATEST"
+        
+        # Build image dengan tag SHA dan latest
+        docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
+        
+        # Get image digest
+        DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_TAG 2>/dev/null || echo "")
+        echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+    - name: 📤 Push Image ke Container Registry
+      run: |
+        echo "📤 Pushing Docker image ke Google Container Registry..."
+        echo "🚀 Pushing: $IMAGE_TAG"
+        docker push $IMAGE_TAG
+        echo "🚀 Pushing: $IMAGE_LATEST"
+        docker push $IMAGE_LATEST
+        
+        echo "✅ Image berhasil di-push ke GCR:"
+        echo "  - $IMAGE_TAG"
+        echo "  - $IMAGE_LATEST"
+
+  # TAHAP 3: Deploy to GKE
+  deploy-to-gke:
+    name: "3️⃣ Deploy to GKE"
+    runs-on: ubuntu-latest
+    needs: build-push-image  # Job berjalan berurutan setelah tahap 2
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout kode
+      uses: actions/checkout@v4
+
+    - name: Setup Google Cloud CLI
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        service_account_key: ${{ secrets.GCP_SA_KEY }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: 🔐 Get GKE credentials
+      run: |
+        echo "🔐 Mendapatkan credentials untuk GKE cluster..."
+        gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$GKE_ZONE"
+        
+        # Verify connection
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: 📝 Update Kubernetes configurations
+      run: |
+        echo "📝 Updating Kubernetes YAML configurations..."
+        # Replace white-berm-462508-k7 placeholder dalam deployment.yaml jika diperlukan
+        sed -i "s/white-berm-462508-k7/$PROJECT_ID/g" k8s/deployment.yaml
+        
+        # Verify updated configuration
+        echo "📋 Updated deployment.yaml:"
+        grep "image:" k8s/deployment.yaml
+
+    - name: 🚀 Apply Kubernetes configurations menggunakan kubectl
+      run: |
+        echo "🚀 Applying Kubernetes configurations..."
+        
+        # Apply semua konfigurasi YAML
+        echo "📋 Applying deployment..."
+        kubectl apply -f k8s/deployment.yaml
+        
+        echo "📋 Applying service..."
+        kubectl apply -f k8s/service.yaml
+        
+        echo "📋 Applying ingress..."
+        kubectl apply -f k8s/ingress.yaml
+
+    - name: 🔄 Update deployment dengan image baru
+      run: |
+        echo "🔄 Updating deployment dengan image yang baru di-push..."
+        NEW_IMAGE="gcr.io/$PROJECT_ID/$IMAGE:${{ github.sha }}"
+        
+        # Update deployment dengan image baru
+        kubectl set image deployment/$DEPLOYMENT_NAME $DEPLOYMENT_NAME=$NEW_IMAGE
+        
+        echo "✅ Deployment updated dengan image: $NEW_IMAGE"
+
+    - name: ⏳ Tunggu rollout selesai
+      run: |
+        echo "⏳ Menunggu rollout deployment selesai..."
+        kubectl rollout status deployment/$DEPLOYMENT_NAME --timeout=300s
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ Rollout berhasil!"
+        else
+          echo "❌ Rollout gagal!"
+          kubectl describe deployment/$DEPLOYMENT_NAME
+          exit 1
+        fi
+
+    - name: 🔍 Verifikasi deployment
+      run: |
+        echo "🔍 Verifikasi status deployment..."
+        
+        echo "📊 Pod status:"
+        kubectl get pods -l app=$DEPLOYMENT_NAME -o wide
+        
+        echo "📊 Service status:"
+        kubectl get svc todo-api-service -o wide
+        
+        echo "📊 Ingress status:"
+        kubectl get ingress todo-api-ingress
+        
+        echo "📊 Deployment status:"
+        kubectl get deployment $DEPLOYMENT_NAME
+        
+        # Test health check
+        echo "🏥 Testing health check..."
+        kubectl wait --for=condition=ready pod -l app=$DEPLOYMENT_NAME --timeout=120s
+        
+        echo "✅ Deployment verification completed!"
+
+    - name: 📋 Deployment Summary
+      run: |
+        echo "📋 === DEPLOYMENT SUMMARY ==="
+        echo "🏷️  Image: gcr.io/$PROJECT_ID/$IMAGE:${{ github.sha }}"
+        echo "🎯 Cluster: $GKE_CLUSTER ($GKE_ZONE)"
+        echo "📦 Deployment: $DEPLOYMENT_NAME"
+        echo "🌐 Service: todo-api-service"
+        echo "🔗 Ingress: todo-api-ingress"
+        echo "📅 Deployed at: $(date)"
+        echo "👤 Triggered by: ${{ github.actor }}"
+        echo "📝 Commit: ${{ github.sha }}"
+        echo "=========================="
